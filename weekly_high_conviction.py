@@ -51,6 +51,10 @@ RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "")
 UNIVERSE_JSON_PATH = os.getenv("UNIVERSE_JSON_PATH", "universe.json")
 DAILY_SCREENER_CSV = os.getenv("DAILY_SCREENER_CSV", "")
 
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
+TEST_TICKERS = [x.strip().upper() for x in os.getenv("TEST_TICKERS", "AAPL, MSFT, NVDA, AMZN, META, SWX, COST, NJR, ALL, CTVA").split(",") if x.strip()]
+
+
 MIN_CONVICTION_SCORE = float(os.getenv("MIN_CONVICTION_SCORE", "75"))
 MAX_DRAWDOWN_FILTER = float(os.getenv("MAX_DRAWDOWN_FILTER", "0.08"))
 MIN_MARKET_CAP_BILLIONS = float(os.getenv("MIN_MARKET_CAP_BILLIONS", "5"))
@@ -192,6 +196,22 @@ def load_daily_screener_tickers() -> List[str]:
 
 def build_universe() -> List[Dict]:
     universe = load_universe()
+
+    if TEST_MODE:
+    logger.info(f"TEST_MODE enabled - using {len(TEST_TICKERS)} tickers: {TEST_TICKERS}")
+    by_symbol = {item["symbol"]: item for item in universe}
+    return [
+        by_symbol.get(symbol, {
+            "symbol": symbol,
+            "name": "",
+            "sector": "",
+            "industry": "",
+            "market_cap": None,
+            "avg_volume": None,
+        })
+        for symbol in TEST_TICKERS
+    ]
+
     if not universe:
         return []
 
