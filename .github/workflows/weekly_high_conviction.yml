@@ -49,7 +49,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
         run: |
-          python python weekly_high_conviction.py
+          python weekly_high_conviction.py
 
       - name: Upload weekly artifacts
         if: always()
