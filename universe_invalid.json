@@ -1,0 +1,44 @@
+{
+  "generated_at": "2026-05-09T16:26:57.625712+00:00",
+  "total_invalid": 8,
+  "stats": {
+    "valid_equity": 6378,
+    "invalid": 5,
+    "timeout": 3,
+    "error": 0
+  },
+  "invalid_symbols": [
+    {
+      "symbol": "AMIX",
+      "reason": "INVALID"
+    },
+    {
+      "symbol": "CICB",
+      "reason": "TIMEOUT"
+    },
+    {
+      "symbol": "CTBB",
+      "reason": "INVALID"
+    },
+    {
+      "symbol": "CTDD",
+      "reason": "INVALID"
+    },
+    {
+      "symbol": "FSSL",
+      "reason": "INVALID"
+    },
+    {
+      "symbol": "MCHP",
+      "reason": "TIMEOUT"
+    },
+    {
+      "symbol": "MKTX",
+      "reason": "TIMEOUT"
+    },
+    {
+      "symbol": "SWZ",
+      "reason": "INVALID"
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+name: Weekly High Conviction Screener
+
+on:
+  schedule:
+    # GitHub Actions cron uses UTC.
+    # 12:00 UTC Saturday is 8:00 AM in New York during daylight saving time.
+    - cron: '0 12 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-high-conviction
+  cancel-in-progress: false
+
+jobs:
+  run-weekly-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run weekly screener
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          EMAIL_ADDRESS: ${{ secrets.SENDER_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          python python weekly_high_conviction.py
+
+      - name: Upload weekly artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-high-conviction-${{ github.run_number }}
+          path: |
+            weekly_high_conviction.log
+            weekly_trades_log.csv
+            weekly_report_*.md
+          if-no-files-found: warn
+          retention-days: 14
