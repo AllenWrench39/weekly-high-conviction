@@ -198,8 +198,8 @@ def build_universe() -> List[Dict]:
     universe = load_universe()
 
     if TEST_MODE:
-    logger.info(f"TEST_MODE enabled - using {len(TEST_TICKERS)} tickers: {TEST_TICKERS}")
-    by_symbol = {item["symbol"]: item for item in universe}
+       logger.info(f"TEST_MODE enabled - using {len(TEST_TICKERS)} tickers: {TEST_TICKERS}")
+       by_symbol = {item["symbol"]: item for item in universe}
     return [
         by_symbol.get(symbol, {
             "symbol": symbol,
