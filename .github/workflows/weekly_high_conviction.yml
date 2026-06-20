@@ -49,8 +49,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
 
-          TEST_MODE: "true"
-          TEST_TICKERS: "AAPL, MSFT, NVDA, AMZN, META, SWX, COST, NJR, ALL, CTVA"
+          TEST_MODE: "false"
         run: |
           python weekly_high_conviction.py
 

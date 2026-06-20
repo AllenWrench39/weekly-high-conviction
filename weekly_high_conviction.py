@@ -56,7 +56,7 @@ TEST_TICKERS = [x.strip().upper() for x in os.getenv("TEST_TICKERS", "AAPL, MSFT
 
 
 MIN_CONVICTION_SCORE = float(os.getenv("MIN_CONVICTION_SCORE", "75"))
-MAX_DRAWDOWN_FILTER = float(os.getenv("MAX_DRAWDOWN_FILTER", "0.08"))
+MAX_DRAWDOWN_FILTER = float(os.getenv("MAX_DRAWDOWN_FILTER", "0.15"))
 MIN_MARKET_CAP_BILLIONS = float(os.getenv("MIN_MARKET_CAP_BILLIONS", "5"))
 MIN_AVG_VOLUME = int(os.getenv("MIN_AVG_VOLUME", "500000"))
 LOOKBACK_TECHNICAL_DAYS = int(os.getenv("LOOKBACK_TECHNICAL_DAYS", "180"))
@@ -194,23 +194,48 @@ def load_daily_screener_tickers() -> List[str]:
         return []
 
 
+def _prefilter_by_metadata(universe: List[Dict]) -> List[Dict]:
+    """Drop names that clearly fail the cap/volume gates using only the
+    metadata already in universe.json. This avoids thousands of per-symbol
+    yfinance calls later. Names missing metadata are kept and re-checked
+    in the screen loop once fundamentals are fetched."""
+    min_cap = MIN_MARKET_CAP_BILLIONS * 1e9
+    kept = []
+    for item in universe:
+        market_cap = item.get("market_cap")
+        avg_volume = item.get("avg_volume")
+
+        if market_cap is not None and market_cap < min_cap:
+            continue
+        if avg_volume is not None and avg_volume < MIN_AVG_VOLUME:
+            continue
+
+        kept.append(item)
+
+    logger.info(
+        f"Metadata pre-filter: {len(kept)}/{len(universe)} survive "
+        f"cap>=${MIN_MARKET_CAP_BILLIONS:.0f}B and volume>={MIN_AVG_VOLUME:,}"
+    )
+    return kept
+
+
 def build_universe() -> List[Dict]:
     universe = load_universe()
 
     if TEST_MODE:
-       logger.info(f"TEST_MODE enabled - using {len(TEST_TICKERS)} tickers: {TEST_TICKERS}")
-       by_symbol = {item["symbol"]: item for item in universe}
-    return [
-        by_symbol.get(symbol, {
-            "symbol": symbol,
-            "name": "",
-            "sector": "",
-            "industry": "",
-            "market_cap": None,
-            "avg_volume": None,
-        })
-        for symbol in TEST_TICKERS
-    ]
+        logger.info(f"TEST_MODE enabled - using {len(TEST_TICKERS)} tickers: {TEST_TICKERS}")
+        by_symbol = {item["symbol"]: item for item in universe}
+        return [
+            by_symbol.get(symbol, {
+                "symbol": symbol,
+                "name": "",
+                "sector": "",
+                "industry": "",
+                "market_cap": None,
+                "avg_volume": None,
+            })
+            for symbol in TEST_TICKERS
+        ]
 
     if not universe:
         return []
@@ -228,7 +253,7 @@ def build_universe() -> List[Dict]:
                 "avg_volume": None,
             }
 
-    result = list(by_symbol.values())
+    result = _prefilter_by_metadata(list(by_symbol.values()))
     logger.info(f"Final universe size: {len(result)}")
     return result
 
@@ -649,7 +674,7 @@ def score_macro(sector: str, macro: Dict) -> Tuple[float, str]:
             details.append("Financials: rates favorable")
         else:
             score = 55
-    elif "Healthcare" in sector or "Consumer Staples" in sector:
+    elif "Healthcare" in sector or "Consumer Defensive" in sector or "Consumer Staples" in sector:
         score = 65
         details.append("Defensive sector")
 
@@ -847,6 +872,11 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
     logger.info(f"Starting weekly screen on {len(tickers)} symbols")
     all_bars = get_all_bars(tickers)
 
+    # Max score a perfect fundamental/macro bucket can contribute. Used to
+    # cheaply reject names before paying for a per-symbol yfinance.info call.
+    MAX_FUND_SCORE = 100.0
+    MAX_MACRO_SCORE = 100.0
+
     processed = 0
     for ticker, bars in all_bars.items():
         processed += 1
@@ -854,10 +884,32 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
             logger.info(f"Processed {processed}/{len(all_bars)} | qualified={len(qualified)}")
 
         try:
-            if check_earnings_soon(ticker):
+            meta = meta_by_symbol.get(ticker, {})
+
+            # --- Free, bar-based scores first (no network calls) ---
+            tech_score, tech_detail = score_technical(bars)
+            risk_score, risk_detail = score_risk_adjusted(bars)
+            macro_score, macro_detail = score_macro(meta.get("sector", ""), macro)
+
+            # If even a perfect fundamental bucket can't clear the threshold,
+            # skip before fetching fundamentals/earnings over the network.
+            best_possible = (
+                MAX_FUND_SCORE * WEIGHT_FUNDAMENTAL
+                + tech_score * WEIGHT_TECHNICAL
+                + macro_score * WEIGHT_MACRO
+                + risk_score * WEIGHT_RISK_ADJUSTED
+            )
+            if best_possible < MIN_CONVICTION_SCORE:
                 continue
 
-            fundamentals = get_fundamentals(ticker, meta_by_symbol.get(ticker, {}))
+            # --- Drawdown gate (free) before any network call ---
+            recent_prices = bars["close"].iloc[max(0, len(bars) - 63):]
+            max_dd = calculate_max_drawdown(recent_prices)
+            if max_dd < -MAX_DRAWDOWN_FILTER:
+                continue
+
+            # --- Now pay for fundamentals (yfinance.info) ---
+            fundamentals = get_fundamentals(ticker, meta)
 
             market_cap = fundamentals.get("market_cap")
             if not market_cap or market_cap / 1e9 < MIN_MARKET_CAP_BILLIONS:
@@ -867,14 +919,27 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
             if not avg_volume or avg_volume < MIN_AVG_VOLUME:
                 continue
 
-            conviction, breakdown = calculate_conviction(bars, fundamentals, macro)
+            fund_score, fund_detail = score_fundamental(fundamentals)
+            conviction = (
+                fund_score * WEIGHT_FUNDAMENTAL
+                + tech_score * WEIGHT_TECHNICAL
+                + macro_score * WEIGHT_MACRO
+                + risk_score * WEIGHT_RISK_ADJUSTED
+            )
             if conviction < MIN_CONVICTION_SCORE:
                 continue
 
-            recent_prices = bars["close"].iloc[max(0, len(bars) - 63):]
-            max_dd = calculate_max_drawdown(recent_prices)
-            if max_dd < -MAX_DRAWDOWN_FILTER:
-                continue
+            breakdown = {
+                "fundamental": fund_score,
+                "technical": tech_score,
+                "macro": macro_score,
+                "risk_adjusted": risk_score,
+                "overall": conviction,
+                "fundamental_detail": fund_detail,
+                "technical_detail": tech_detail,
+                "macro_detail": macro_detail,
+                "risk_detail": risk_detail,
+            }
 
             current_price = get_latest_price(ticker, bars)
             if not current_price or current_price <= 0:
@@ -883,6 +948,10 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
             atr_14 = calculate_atr(bars).iloc[-1]
             rtr = calculate_rtr(current_price, bars, atr_14)
             if not rtr["rr_ratio"] or rtr["rr_ratio"] < 1.0:
+                continue
+
+            # --- Earnings check last: only on the few survivors ---
+            if check_earnings_soon(ticker):
                 continue
 
             perspectives = generate_perspectives(ticker, breakdown, bars)
@@ -911,7 +980,7 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
         except Exception as exc:
             logger.debug(f"Error processing {ticker}: {exc}")
 
-    qualified.sort(key=lambda x: (x["rr_ratio"], x["conviction_score"]), reverse=True)
+    qualified.sort(key=lambda x: (x["conviction_score"], x["rr_ratio"]), reverse=True)
     logger.info(f"Screening complete: {len(qualified)} qualified trades")
     return qualified
 
