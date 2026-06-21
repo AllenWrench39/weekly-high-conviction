@@ -48,9 +48,9 @@ jobs:
           EMAIL_ADDRESS: ${{ secrets.SENDER_EMAIL }}
           EMAIL_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
 
-          TEST_MODE: "true"
-          TEST_TICKERS: "AAPL, MSFT, NVDA, AMZN, META, SWX, COST, NJR, ALL, CTVA"
+          TEST_MODE: "false"
         run: |
           python weekly_high_conviction.py
 

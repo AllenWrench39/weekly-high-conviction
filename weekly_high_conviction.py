@@ -12,6 +12,7 @@ import logging
 import os
 import smtplib
 import sys
+import time
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -19,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 try:
@@ -48,6 +50,16 @@ EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "")
 
+# Finnhub: optional primary source for fundamentals/earnings/quotes/bars.
+# When no key is set, every Finnhub call is skipped and the script falls
+# back to yfinance, so it stays safe to "test it out" without one.
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+USE_FINNHUB = bool(FINNHUB_API_KEY) and os.getenv("USE_FINNHUB", "true").lower() == "true"
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
+FINNHUB_TIMEOUT = int(os.getenv("FINNHUB_TIMEOUT", "10"))
+# Free tier allows 60 calls/min; stay just under to avoid 429s.
+FINNHUB_RATE_LIMIT_PER_MIN = int(os.getenv("FINNHUB_RATE_LIMIT_PER_MIN", "55"))
+
 UNIVERSE_JSON_PATH = os.getenv("UNIVERSE_JSON_PATH", "universe.json")
 DAILY_SCREENER_CSV = os.getenv("DAILY_SCREENER_CSV", "")
 
@@ -56,11 +68,14 @@ TEST_TICKERS = [x.strip().upper() for x in os.getenv("TEST_TICKERS", "AAPL, MSFT
 
 
 MIN_CONVICTION_SCORE = float(os.getenv("MIN_CONVICTION_SCORE", "75"))
-MAX_DRAWDOWN_FILTER = float(os.getenv("MAX_DRAWDOWN_FILTER", "0.08"))
+MAX_DRAWDOWN_FILTER = float(os.getenv("MAX_DRAWDOWN_FILTER", "0.15"))
 MIN_MARKET_CAP_BILLIONS = float(os.getenv("MIN_MARKET_CAP_BILLIONS", "5"))
 MIN_AVG_VOLUME = int(os.getenv("MIN_AVG_VOLUME", "500000"))
 LOOKBACK_TECHNICAL_DAYS = int(os.getenv("LOOKBACK_TECHNICAL_DAYS", "180"))
 EXCLUDE_EARNINGS_DAYS = int(os.getenv("EXCLUDE_EARNINGS_DAYS", "7"))
+# Only the top-ranked candidates (by free, bar-based scores) get a per-symbol
+# fundamentals lookup. Caps slow/rate-limited calls (esp. Finnhub free tier).
+FUNDAMENTAL_CANDIDATE_LIMIT = int(os.getenv("FUNDAMENTAL_CANDIDATE_LIMIT", "100"))
 ENABLE_SPY_TREND_FILTER = os.getenv("ENABLE_SPY_TREND_FILTER", "true").lower() == "true"
 SPY_BEARISH_CONVICTION_BOOST = float(os.getenv("SPY_BEARISH_CONVICTION_BOOST", "10"))
 
@@ -112,6 +127,182 @@ def init_alpaca_backup() -> bool:
     except Exception as exc:
         logger.warning(f"Alpaca backup init failed: {exc}")
         return False
+
+
+# ============================================================================
+# FINNHUB (optional primary source)
+# ============================================================================
+
+_finnhub_last_call = 0.0
+_finnhub_min_interval = 60.0 / max(FINNHUB_RATE_LIMIT_PER_MIN, 1)
+
+# Lightweight usage stats so a full run shows whether the key actually worked.
+_finnhub_stats = {"calls": 0, "ok": 0, "auth_fail": 0, "forbidden": 0}
+
+
+def _finnhub_get(path: str, params: Dict) -> Optional[dict]:
+    """Rate-limited GET against the Finnhub REST API. Returns parsed JSON,
+    or None on any error (missing key, 401/403/429, timeout, bad payload) so
+    callers can fall back to yfinance."""
+    global _finnhub_last_call
+
+    if not USE_FINNHUB:
+        return None
+
+    wait = _finnhub_min_interval - (time.monotonic() - _finnhub_last_call)
+    if wait > 0:
+        time.sleep(wait)
+
+    _finnhub_stats["calls"] += 1
+    try:
+        query = dict(params)
+        query["token"] = FINNHUB_API_KEY
+        resp = requests.get(
+            f"{FINNHUB_BASE_URL}{path}",
+            params=query,
+            timeout=FINNHUB_TIMEOUT,
+        )
+        _finnhub_last_call = time.monotonic()
+
+        if resp.status_code == 401:
+            _finnhub_stats["auth_fail"] += 1
+            logger.debug(f"Finnhub 401 for {path} (invalid API key)")
+            return None
+        if resp.status_code == 429:
+            logger.warning("Finnhub rate limit hit (429) - backing off")
+            time.sleep(2)
+            return None
+        if resp.status_code == 403:
+            _finnhub_stats["forbidden"] += 1
+            logger.debug(f"Finnhub 403 for {path} (plan does not allow this endpoint)")
+            return None
+        resp.raise_for_status()
+        _finnhub_stats["ok"] += 1
+        return resp.json()
+    except Exception as exc:
+        _finnhub_last_call = time.monotonic()
+        logger.debug(f"Finnhub request failed for {path}: {exc}")
+        return None
+
+
+def log_finnhub_summary() -> None:
+    if not USE_FINNHUB:
+        return
+
+    stats = _finnhub_stats
+    logger.info(
+        f"Finnhub usage: {stats['ok']}/{stats['calls']} calls returned data "
+        f"(auth_fail={stats['auth_fail']}, forbidden={stats['forbidden']})"
+    )
+    if stats["calls"] and stats["ok"] == 0:
+        if stats["auth_fail"]:
+            logger.warning("Finnhub key appears INVALID (all calls 401) - ran on yfinance fallback")
+        else:
+            logger.warning("Finnhub returned no usable data - ran on yfinance fallback")
+    elif stats["ok"]:
+        logger.info("Finnhub is working and served live data")
+
+
+def finnhub_get_fundamentals(ticker: str) -> Optional[Dict]:
+    data = _finnhub_get("/stock/metric", {"symbol": ticker, "metric": "all"})
+    if not data:
+        return None
+
+    metric = data.get("metric")
+    if not isinstance(metric, dict):
+        return None
+
+    def first(*keys):
+        for key in keys:
+            value = metric.get(key)
+            if value is not None:
+                return value
+        return None
+
+    roe_pct = first("roeTTM", "roeAnnual")
+    eg_pct = first("epsGrowthTTMYoy", "epsGrowthQuarterlyYoy", "revenueGrowthTTMYoy")
+    de = first("totalDebt/totalEquityQuarterly", "totalDebt/totalEquityAnnual",
+               "longTermDebt/equityQuarterly", "longTermDebt/equityAnnual")
+    cap_millions = first("marketCapitalization")
+    vol_millions = first("10DayAverageTradingVolume", "3MonthAverageTradingVolume")
+
+    return {
+        # Finnhub reports ROE / EPS growth as percentages; convert to the
+        # fractions score_fundamental() expects (yfinance convention).
+        "roe": (roe_pct / 100.0) if roe_pct is not None else None,
+        "earnings_growth": (eg_pct / 100.0) if eg_pct is not None else None,
+        "debt_to_equity": de,
+        "market_cap": (cap_millions * 1e6) if cap_millions is not None else None,
+        "avg_volume": (vol_millions * 1e6) if vol_millions is not None else None,
+    }
+
+
+def finnhub_check_earnings_soon(ticker: str) -> Optional[bool]:
+    """Returns True/False if Finnhub answered, or None if unavailable so the
+    caller can fall back to yfinance."""
+    today = datetime.now().date()
+    end = today + timedelta(days=EXCLUDE_EARNINGS_DAYS)
+    data = _finnhub_get(
+        "/calendar/earnings",
+        {"from": today.isoformat(), "to": end.isoformat(), "symbol": ticker},
+    )
+    if data is None:
+        return None
+
+    events = data.get("earningsCalendar")
+    if not isinstance(events, list):
+        return False
+
+    for event in events:
+        date_str = event.get("date")
+        if not date_str:
+            continue
+        try:
+            event_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if 0 <= (event_date - today).days <= EXCLUDE_EARNINGS_DAYS:
+            return True
+    return False
+
+
+def finnhub_get_quote(ticker: str) -> Optional[float]:
+    data = _finnhub_get("/quote", {"symbol": ticker})
+    if not data:
+        return None
+    for key in ("c", "pc"):
+        value = data.get(key)
+        if value and value > 0:
+            return float(value)
+    return None
+
+
+def finnhub_get_bars(ticker: str, num_days: int) -> Optional[pd.DataFrame]:
+    end = int(time.time())
+    start = end - (num_days + 40) * 86400
+    data = _finnhub_get(
+        "/stock/candle",
+        {"symbol": ticker, "resolution": "D", "from": start, "to": end},
+    )
+    if not data or data.get("s") != "ok":
+        return None
+
+    try:
+        df = pd.DataFrame(
+            {
+                "open": data["o"],
+                "high": data["h"],
+                "low": data["l"],
+                "close": data["c"],
+                "volume": data["v"],
+            },
+            index=pd.to_datetime(data["t"], unit="s"),
+        ).dropna().sort_index()
+        if len(df) < 50:
+            return None
+        return df
+    except Exception:
+        return None
 
 
 # ============================================================================
@@ -194,23 +385,48 @@ def load_daily_screener_tickers() -> List[str]:
         return []
 
 
+def _prefilter_by_metadata(universe: List[Dict]) -> List[Dict]:
+    """Drop names that clearly fail the cap/volume gates using only the
+    metadata already in universe.json. This avoids thousands of per-symbol
+    yfinance calls later. Names missing metadata are kept and re-checked
+    in the screen loop once fundamentals are fetched."""
+    min_cap = MIN_MARKET_CAP_BILLIONS * 1e9
+    kept = []
+    for item in universe:
+        market_cap = item.get("market_cap")
+        avg_volume = item.get("avg_volume")
+
+        if market_cap is not None and market_cap < min_cap:
+            continue
+        if avg_volume is not None and avg_volume < MIN_AVG_VOLUME:
+            continue
+
+        kept.append(item)
+
+    logger.info(
+        f"Metadata pre-filter: {len(kept)}/{len(universe)} survive "
+        f"cap>=${MIN_MARKET_CAP_BILLIONS:.0f}B and volume>={MIN_AVG_VOLUME:,}"
+    )
+    return kept
+
+
 def build_universe() -> List[Dict]:
     universe = load_universe()
 
     if TEST_MODE:
-       logger.info(f"TEST_MODE enabled - using {len(TEST_TICKERS)} tickers: {TEST_TICKERS}")
-       by_symbol = {item["symbol"]: item for item in universe}
-    return [
-        by_symbol.get(symbol, {
-            "symbol": symbol,
-            "name": "",
-            "sector": "",
-            "industry": "",
-            "market_cap": None,
-            "avg_volume": None,
-        })
-        for symbol in TEST_TICKERS
-    ]
+        logger.info(f"TEST_MODE enabled - using {len(TEST_TICKERS)} tickers: {TEST_TICKERS}")
+        by_symbol = {item["symbol"]: item for item in universe}
+        return [
+            by_symbol.get(symbol, {
+                "symbol": symbol,
+                "name": "",
+                "sector": "",
+                "industry": "",
+                "market_cap": None,
+                "avg_volume": None,
+            })
+            for symbol in TEST_TICKERS
+        ]
 
     if not universe:
         return []
@@ -228,7 +444,7 @@ def build_universe() -> List[Dict]:
                 "avg_volume": None,
             }
 
-    result = list(by_symbol.values())
+    result = _prefilter_by_metadata(list(by_symbol.values()))
     logger.info(f"Final universe size: {len(result)}")
     return result
 
@@ -351,6 +567,23 @@ def get_all_bars(tickers: List[str]) -> Dict[str, pd.DataFrame]:
             batch = missing[i:i + ALPACA_BATCH_SIZE]
             bars.update(get_bars_alpaca_batch(batch, LOOKBACK_TECHNICAL_DAYS))
 
+    still_missing = [ticker for ticker in tickers if ticker not in bars]
+    if still_missing and USE_FINNHUB:
+        logger.info(f"Trying Finnhub bars for {len(still_missing)} symbols...")
+        consecutive_failures = 0
+        for ticker in still_missing:
+            df = finnhub_get_bars(ticker, LOOKBACK_TECHNICAL_DAYS)
+            if df is not None:
+                bars[ticker] = df
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                # Candle history needs a paid plan; bail early instead of
+                # burning the rate limit on an endpoint we can't access.
+                if consecutive_failures >= 5:
+                    logger.info("Finnhub bars unavailable - stopping fallback")
+                    break
+
     logger.info(f"Got bars for {len(bars)} symbols")
     return bars
 
@@ -363,6 +596,10 @@ def get_latest_price(ticker: str, bars: Optional[pd.DataFrame] = None) -> Option
                 return price
         except Exception:
             pass
+
+    fh_price = finnhub_get_quote(ticker)
+    if fh_price:
+        return fh_price
 
     try:
         info = yf.Ticker(ticker).fast_info
@@ -401,20 +638,36 @@ def get_yf_info(ticker: str) -> Dict:
 
 
 def get_fundamentals(ticker: str, universe_meta: Dict) -> Dict:
-    info = get_yf_info(ticker)
+    fh = finnhub_get_fundamentals(ticker) or {}
+    roe = fh.get("roe")
+    de = fh.get("debt_to_equity")
+    eg = fh.get("earnings_growth")
+
+    sector = universe_meta.get("sector") or ""
+    industry = universe_meta.get("industry") or ""
+
+    # Only pay for the slow yfinance.info call when Finnhub gave us nothing
+    # useful, or when we still need sector metadata for the macro score.
+    need_yf = (roe is None and de is None and eg is None) or not sector
+    info = get_yf_info(ticker) if need_yf else {}
 
     return {
-        "roe": info.get("returnOnEquity"),
-        "debt_to_equity": info.get("debtToEquity"),
-        "earnings_growth": info.get("earningsGrowth"),
-        "market_cap": universe_meta.get("market_cap") or info.get("marketCap"),
-        "avg_volume": universe_meta.get("avg_volume") or info.get("averageVolume") or info.get("averageDailyVolume10Day"),
-        "sector": universe_meta.get("sector") or info.get("sector", ""),
-        "industry": universe_meta.get("industry") or info.get("industry", ""),
+        "roe": roe if roe is not None else info.get("returnOnEquity"),
+        "debt_to_equity": de if de is not None else info.get("debtToEquity"),
+        "earnings_growth": eg if eg is not None else info.get("earningsGrowth"),
+        "market_cap": universe_meta.get("market_cap") or fh.get("market_cap") or info.get("marketCap"),
+        "avg_volume": (universe_meta.get("avg_volume") or fh.get("avg_volume")
+                       or info.get("averageVolume") or info.get("averageDailyVolume10Day")),
+        "sector": sector or info.get("sector", ""),
+        "industry": industry or info.get("industry", ""),
     }
 
 
 def check_earnings_soon(ticker: str) -> bool:
+    fh = finnhub_check_earnings_soon(ticker)
+    if fh is not None:
+        return fh
+
     try:
         cal = yf.Ticker(ticker).calendar
         if cal is None or (isinstance(cal, dict) and not cal):
@@ -649,7 +902,7 @@ def score_macro(sector: str, macro: Dict) -> Tuple[float, str]:
             details.append("Financials: rates favorable")
         else:
             score = 55
-    elif "Healthcare" in sector or "Consumer Staples" in sector:
+    elif "Healthcare" in sector or "Consumer Defensive" in sector or "Consumer Staples" in sector:
         score = 65
         details.append("Defensive sector")
 
@@ -847,17 +1100,75 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
     logger.info(f"Starting weekly screen on {len(tickers)} symbols")
     all_bars = get_all_bars(tickers)
 
-    processed = 0
-    for ticker, bars in all_bars.items():
-        processed += 1
-        if processed % 100 == 0:
-            logger.info(f"Processed {processed}/{len(all_bars)} | qualified={len(qualified)}")
+    # Max score a perfect fundamental bucket can contribute. Used to cheaply
+    # reject names that can't clear the threshold even with ideal fundamentals.
+    MAX_FUND_SCORE = 100.0
 
+    # ------------------------------------------------------------------
+    # Pass 1: free, bar-based scoring for every name (no network calls).
+    # Collect candidates, then rank and keep only the strongest few for the
+    # expensive per-symbol fundamentals lookup.
+    # ------------------------------------------------------------------
+    candidates = []
+    for ticker, bars in all_bars.items():
         try:
-            if check_earnings_soon(ticker):
+            meta = meta_by_symbol.get(ticker, {})
+
+            tech_score, tech_detail = score_technical(bars)
+            risk_score, risk_detail = score_risk_adjusted(bars)
+            macro_score, macro_detail = score_macro(meta.get("sector", ""), macro)
+
+            # Partial conviction from everything except fundamentals.
+            partial = (
+                tech_score * WEIGHT_TECHNICAL
+                + macro_score * WEIGHT_MACRO
+                + risk_score * WEIGHT_RISK_ADJUSTED
+            )
+            # Skip if even a perfect fundamental bucket can't clear threshold.
+            if partial + MAX_FUND_SCORE * WEIGHT_FUNDAMENTAL < MIN_CONVICTION_SCORE:
                 continue
 
-            fundamentals = get_fundamentals(ticker, meta_by_symbol.get(ticker, {}))
+            recent_prices = bars["close"].iloc[max(0, len(bars) - 63):]
+            max_dd = calculate_max_drawdown(recent_prices)
+            if max_dd < -MAX_DRAWDOWN_FILTER:
+                continue
+
+            candidates.append({
+                "ticker": ticker,
+                "bars": bars,
+                "meta": meta,
+                "partial": partial,
+                "max_dd": max_dd,
+                "tech_score": tech_score, "tech_detail": tech_detail,
+                "risk_score": risk_score, "risk_detail": risk_detail,
+                "macro_score": macro_score, "macro_detail": macro_detail,
+            })
+        except Exception as exc:
+            logger.debug(f"Pass-1 error for {ticker}: {exc}")
+
+    candidates.sort(key=lambda c: c["partial"], reverse=True)
+    short_list = candidates[:FUNDAMENTAL_CANDIDATE_LIMIT]
+    logger.info(
+        f"Pass 1: {len(candidates)} candidates passed free filters; "
+        f"fetching fundamentals for top {len(short_list)}"
+    )
+
+    # ------------------------------------------------------------------
+    # Pass 2: per-symbol fundamentals + earnings, only for the short list.
+    # ------------------------------------------------------------------
+    processed = 0
+    for cand in short_list:
+        processed += 1
+        if processed % 25 == 0:
+            logger.info(f"Fundamentals {processed}/{len(short_list)} | qualified={len(qualified)}")
+
+        ticker = cand["ticker"]
+        bars = cand["bars"]
+        tech_score, risk_score, macro_score = cand["tech_score"], cand["risk_score"], cand["macro_score"]
+        max_dd = cand["max_dd"]
+
+        try:
+            fundamentals = get_fundamentals(ticker, cand["meta"])
 
             market_cap = fundamentals.get("market_cap")
             if not market_cap or market_cap / 1e9 < MIN_MARKET_CAP_BILLIONS:
@@ -867,14 +1178,27 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
             if not avg_volume or avg_volume < MIN_AVG_VOLUME:
                 continue
 
-            conviction, breakdown = calculate_conviction(bars, fundamentals, macro)
+            fund_score, fund_detail = score_fundamental(fundamentals)
+            conviction = (
+                fund_score * WEIGHT_FUNDAMENTAL
+                + tech_score * WEIGHT_TECHNICAL
+                + macro_score * WEIGHT_MACRO
+                + risk_score * WEIGHT_RISK_ADJUSTED
+            )
             if conviction < MIN_CONVICTION_SCORE:
                 continue
 
-            recent_prices = bars["close"].iloc[max(0, len(bars) - 63):]
-            max_dd = calculate_max_drawdown(recent_prices)
-            if max_dd < -MAX_DRAWDOWN_FILTER:
-                continue
+            breakdown = {
+                "fundamental": fund_score,
+                "technical": tech_score,
+                "macro": macro_score,
+                "risk_adjusted": risk_score,
+                "overall": conviction,
+                "fundamental_detail": fund_detail,
+                "technical_detail": cand["tech_detail"],
+                "macro_detail": cand["macro_detail"],
+                "risk_detail": cand["risk_detail"],
+            }
 
             current_price = get_latest_price(ticker, bars)
             if not current_price or current_price <= 0:
@@ -883,6 +1207,10 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
             atr_14 = calculate_atr(bars).iloc[-1]
             rtr = calculate_rtr(current_price, bars, atr_14)
             if not rtr["rr_ratio"] or rtr["rr_ratio"] < 1.0:
+                continue
+
+            # --- Earnings check last: only on the few survivors ---
+            if check_earnings_soon(ticker):
                 continue
 
             perspectives = generate_perspectives(ticker, breakdown, bars)
@@ -911,7 +1239,7 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
         except Exception as exc:
             logger.debug(f"Error processing {ticker}: {exc}")
 
-    qualified.sort(key=lambda x: (x["rr_ratio"], x["conviction_score"]), reverse=True)
+    qualified.sort(key=lambda x: (x["conviction_score"], x["rr_ratio"]), reverse=True)
     logger.info(f"Screening complete: {len(qualified)} qualified trades")
     return qualified
 
@@ -1079,6 +1407,13 @@ def main() -> None:
 
     init_alpaca_backup()
 
+    if USE_FINNHUB:
+        logger.info(f"Finnhub enabled (rate limit {FINNHUB_RATE_LIMIT_PER_MIN}/min)")
+    elif FINNHUB_API_KEY:
+        logger.info("Finnhub key present but disabled via USE_FINNHUB")
+    else:
+        logger.info("Finnhub not configured - using yfinance only")
+
     universe = build_universe()
     if not universe:
         logger.error("No usable universe loaded")
@@ -1102,6 +1437,8 @@ def main() -> None:
         export_to_markdown(qualified_trades, macro)
 
     send_weekly_email(qualified_trades[:5] if qualified_trades else [], macro)
+
+    log_finnhub_summary()
 
     logger.info("=" * 85)
     logger.info(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

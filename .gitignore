@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+weekly_high_conviction.log
+weekly_trades_log.csv
+weekly_report_*.md

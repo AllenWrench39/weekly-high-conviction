@@ -121,6 +121,43 @@ def test_market_data() -> None:
         print(f"Missing: {missing}")
 
 
+def test_finnhub(whc, sample_symbols: list[str]) -> None:
+    print_header("Finnhub Connectivity")
+    if whc is None:
+        print("SKIP: module did not import")
+        return
+
+    if not getattr(whc, "FINNHUB_API_KEY", ""):
+        print("SKIP: FINNHUB_API_KEY not set (screener will use yfinance)")
+        return
+
+    if not getattr(whc, "USE_FINNHUB", False):
+        print("INFO: key present but USE_FINNHUB disabled")
+        return
+
+    ticker = (sample_symbols or DEFAULT_TICKERS)[0]
+    print(f"Probing Finnhub with {ticker}...")
+
+    quote = whc.finnhub_get_quote(ticker)
+    print(f"  quote: {'$%.2f' % quote if quote else 'FAIL/None'}")
+
+    fundamentals = whc.finnhub_get_fundamentals(ticker)
+    if fundamentals:
+        print(f"  fundamentals: roe={fundamentals.get('roe')}, "
+              f"d/e={fundamentals.get('debt_to_equity')}, "
+              f"eg={fundamentals.get('earnings_growth')}")
+    else:
+        print("  fundamentals: FAIL/None")
+
+    earnings = whc.finnhub_check_earnings_soon(ticker)
+    print(f"  earnings_soon: {earnings}")
+
+    if quote or fundamentals:
+        print("PASS: Finnhub is reachable and returning data")
+    else:
+        print("FAIL: Finnhub returned no data (check key/plan/allowlist)")
+
+
 def import_weekly_module():
     print_header("Module Import")
     try:
@@ -184,6 +221,7 @@ def main() -> int:
     test_email_env()
     test_market_data()
     whc = import_weekly_module()
+    test_finnhub(whc, sample_symbols)
     test_weekly_helpers(whc, sample_symbols)
     print("\nDone.")
     return 0

@@ -1,0 +1,35 @@
+name: Finnhub Connectivity Check
+
+# Manual-only quick probe: confirms FINNHUB_API_KEY is valid and the plan
+# returns data, without running the full universe screen or sending email.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  finnhub-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Finnhub probe
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          TEST_TICKERS: "AAPL,MSFT,NVDA"
+        run: |
+          python test_weekly_scanner.py
