@@ -73,6 +73,9 @@ MIN_MARKET_CAP_BILLIONS = float(os.getenv("MIN_MARKET_CAP_BILLIONS", "5"))
 MIN_AVG_VOLUME = int(os.getenv("MIN_AVG_VOLUME", "500000"))
 LOOKBACK_TECHNICAL_DAYS = int(os.getenv("LOOKBACK_TECHNICAL_DAYS", "180"))
 EXCLUDE_EARNINGS_DAYS = int(os.getenv("EXCLUDE_EARNINGS_DAYS", "7"))
+# Only the top-ranked candidates (by free, bar-based scores) get a per-symbol
+# fundamentals lookup. Caps slow/rate-limited calls (esp. Finnhub free tier).
+FUNDAMENTAL_CANDIDATE_LIMIT = int(os.getenv("FUNDAMENTAL_CANDIDATE_LIMIT", "100"))
 ENABLE_SPY_TREND_FILTER = os.getenv("ENABLE_SPY_TREND_FILTER", "true").lower() == "true"
 SPY_BEARISH_CONVICTION_BOOST = float(os.getenv("SPY_BEARISH_CONVICTION_BOOST", "10"))
 
@@ -1097,44 +1100,75 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
     logger.info(f"Starting weekly screen on {len(tickers)} symbols")
     all_bars = get_all_bars(tickers)
 
-    # Max score a perfect fundamental/macro bucket can contribute. Used to
-    # cheaply reject names before paying for a per-symbol yfinance.info call.
+    # Max score a perfect fundamental bucket can contribute. Used to cheaply
+    # reject names that can't clear the threshold even with ideal fundamentals.
     MAX_FUND_SCORE = 100.0
-    MAX_MACRO_SCORE = 100.0
 
-    processed = 0
+    # ------------------------------------------------------------------
+    # Pass 1: free, bar-based scoring for every name (no network calls).
+    # Collect candidates, then rank and keep only the strongest few for the
+    # expensive per-symbol fundamentals lookup.
+    # ------------------------------------------------------------------
+    candidates = []
     for ticker, bars in all_bars.items():
-        processed += 1
-        if processed % 100 == 0:
-            logger.info(f"Processed {processed}/{len(all_bars)} | qualified={len(qualified)}")
-
         try:
             meta = meta_by_symbol.get(ticker, {})
 
-            # --- Free, bar-based scores first (no network calls) ---
             tech_score, tech_detail = score_technical(bars)
             risk_score, risk_detail = score_risk_adjusted(bars)
             macro_score, macro_detail = score_macro(meta.get("sector", ""), macro)
 
-            # If even a perfect fundamental bucket can't clear the threshold,
-            # skip before fetching fundamentals/earnings over the network.
-            best_possible = (
-                MAX_FUND_SCORE * WEIGHT_FUNDAMENTAL
-                + tech_score * WEIGHT_TECHNICAL
+            # Partial conviction from everything except fundamentals.
+            partial = (
+                tech_score * WEIGHT_TECHNICAL
                 + macro_score * WEIGHT_MACRO
                 + risk_score * WEIGHT_RISK_ADJUSTED
             )
-            if best_possible < MIN_CONVICTION_SCORE:
+            # Skip if even a perfect fundamental bucket can't clear threshold.
+            if partial + MAX_FUND_SCORE * WEIGHT_FUNDAMENTAL < MIN_CONVICTION_SCORE:
                 continue
 
-            # --- Drawdown gate (free) before any network call ---
             recent_prices = bars["close"].iloc[max(0, len(bars) - 63):]
             max_dd = calculate_max_drawdown(recent_prices)
             if max_dd < -MAX_DRAWDOWN_FILTER:
                 continue
 
-            # --- Now pay for fundamentals (yfinance.info) ---
-            fundamentals = get_fundamentals(ticker, meta)
+            candidates.append({
+                "ticker": ticker,
+                "bars": bars,
+                "meta": meta,
+                "partial": partial,
+                "max_dd": max_dd,
+                "tech_score": tech_score, "tech_detail": tech_detail,
+                "risk_score": risk_score, "risk_detail": risk_detail,
+                "macro_score": macro_score, "macro_detail": macro_detail,
+            })
+        except Exception as exc:
+            logger.debug(f"Pass-1 error for {ticker}: {exc}")
+
+    candidates.sort(key=lambda c: c["partial"], reverse=True)
+    short_list = candidates[:FUNDAMENTAL_CANDIDATE_LIMIT]
+    logger.info(
+        f"Pass 1: {len(candidates)} candidates passed free filters; "
+        f"fetching fundamentals for top {len(short_list)}"
+    )
+
+    # ------------------------------------------------------------------
+    # Pass 2: per-symbol fundamentals + earnings, only for the short list.
+    # ------------------------------------------------------------------
+    processed = 0
+    for cand in short_list:
+        processed += 1
+        if processed % 25 == 0:
+            logger.info(f"Fundamentals {processed}/{len(short_list)} | qualified={len(qualified)}")
+
+        ticker = cand["ticker"]
+        bars = cand["bars"]
+        tech_score, risk_score, macro_score = cand["tech_score"], cand["risk_score"], cand["macro_score"]
+        max_dd = cand["max_dd"]
+
+        try:
+            fundamentals = get_fundamentals(ticker, cand["meta"])
 
             market_cap = fundamentals.get("market_cap")
             if not market_cap or market_cap / 1e9 < MIN_MARKET_CAP_BILLIONS:
@@ -1161,9 +1195,9 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
                 "risk_adjusted": risk_score,
                 "overall": conviction,
                 "fundamental_detail": fund_detail,
-                "technical_detail": tech_detail,
-                "macro_detail": macro_detail,
-                "risk_detail": risk_detail,
+                "technical_detail": cand["tech_detail"],
+                "macro_detail": cand["macro_detail"],
+                "risk_detail": cand["risk_detail"],
             }
 
             current_price = get_latest_price(ticker, bars)
