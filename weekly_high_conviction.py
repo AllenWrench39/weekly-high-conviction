@@ -133,10 +133,13 @@ def init_alpaca_backup() -> bool:
 _finnhub_last_call = 0.0
 _finnhub_min_interval = 60.0 / max(FINNHUB_RATE_LIMIT_PER_MIN, 1)
 
+# Lightweight usage stats so a full run shows whether the key actually worked.
+_finnhub_stats = {"calls": 0, "ok": 0, "auth_fail": 0, "forbidden": 0}
+
 
 def _finnhub_get(path: str, params: Dict) -> Optional[dict]:
     """Rate-limited GET against the Finnhub REST API. Returns parsed JSON,
-    or None on any error (missing key, 403/429, timeout, bad payload) so
+    or None on any error (missing key, 401/403/429, timeout, bad payload) so
     callers can fall back to yfinance."""
     global _finnhub_last_call
 
@@ -147,6 +150,7 @@ def _finnhub_get(path: str, params: Dict) -> Optional[dict]:
     if wait > 0:
         time.sleep(wait)
 
+    _finnhub_stats["calls"] += 1
     try:
         query = dict(params)
         query["token"] = FINNHUB_API_KEY
@@ -157,19 +161,43 @@ def _finnhub_get(path: str, params: Dict) -> Optional[dict]:
         )
         _finnhub_last_call = time.monotonic()
 
+        if resp.status_code == 401:
+            _finnhub_stats["auth_fail"] += 1
+            logger.debug(f"Finnhub 401 for {path} (invalid API key)")
+            return None
         if resp.status_code == 429:
             logger.warning("Finnhub rate limit hit (429) - backing off")
             time.sleep(2)
             return None
         if resp.status_code == 403:
+            _finnhub_stats["forbidden"] += 1
             logger.debug(f"Finnhub 403 for {path} (plan does not allow this endpoint)")
             return None
         resp.raise_for_status()
+        _finnhub_stats["ok"] += 1
         return resp.json()
     except Exception as exc:
         _finnhub_last_call = time.monotonic()
         logger.debug(f"Finnhub request failed for {path}: {exc}")
         return None
+
+
+def log_finnhub_summary() -> None:
+    if not USE_FINNHUB:
+        return
+
+    stats = _finnhub_stats
+    logger.info(
+        f"Finnhub usage: {stats['ok']}/{stats['calls']} calls returned data "
+        f"(auth_fail={stats['auth_fail']}, forbidden={stats['forbidden']})"
+    )
+    if stats["calls"] and stats["ok"] == 0:
+        if stats["auth_fail"]:
+            logger.warning("Finnhub key appears INVALID (all calls 401) - ran on yfinance fallback")
+        else:
+            logger.warning("Finnhub returned no usable data - ran on yfinance fallback")
+    elif stats["ok"]:
+        logger.info("Finnhub is working and served live data")
 
 
 def finnhub_get_fundamentals(ticker: str) -> Optional[Dict]:
@@ -1375,6 +1403,8 @@ def main() -> None:
         export_to_markdown(qualified_trades, macro)
 
     send_weekly_email(qualified_trades[:5] if qualified_trades else [], macro)
+
+    log_finnhub_summary()
 
     logger.info("=" * 85)
     logger.info(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
