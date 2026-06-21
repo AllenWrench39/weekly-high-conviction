@@ -76,6 +76,17 @@ EXCLUDE_EARNINGS_DAYS = int(os.getenv("EXCLUDE_EARNINGS_DAYS", "7"))
 # Only the top-ranked candidates (by free, bar-based scores) get a per-symbol
 # fundamentals lookup. Caps slow/rate-limited calls (esp. Finnhub free tier).
 FUNDAMENTAL_CANDIDATE_LIMIT = int(os.getenv("FUNDAMENTAL_CANDIDATE_LIMIT", "100"))
+
+# --- Trade-level construction (structure + volatility based) ---
+# Stop is placed below structural support / a volatility band; targets are
+# anchored to overhead resistance or a multi-day measured move, and a trade
+# only qualifies if its reward-to-risk clears MIN_RR_RATIO.
+SWING_STOP_ATR_MULT = float(os.getenv("SWING_STOP_ATR_MULT", "2.0"))
+MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "0.12"))
+TARGET_LOOKBACK_DAYS = int(os.getenv("TARGET_LOOKBACK_DAYS", "60"))
+TARGET_WEEKLY_ATR_MULT = float(os.getenv("TARGET_WEEKLY_ATR_MULT", "3.0"))
+MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "2.0"))
+
 ENABLE_SPY_TREND_FILTER = os.getenv("ENABLE_SPY_TREND_FILTER", "true").lower() == "true"
 SPY_BEARISH_CONVICTION_BOOST = float(os.getenv("SPY_BEARISH_CONVICTION_BOOST", "10"))
 
@@ -972,36 +983,65 @@ def calculate_conviction(df: pd.DataFrame, fundamentals: Dict, macro: Dict) -> T
 # ============================================================================
 
 def calculate_rtr(current_price: float, df: pd.DataFrame, atr_14: float) -> Dict:
+    """Structure + volatility based trade levels for a multi-day swing hold.
+
+    - Stop: just below recent structural support or a ~2x ATR band (whichever
+      is safer), with risk capped at MAX_STOP_PCT and floored to avoid a stop
+      that sits inside normal daily noise.
+    - Targets: TP1 anchored to the nearer of overhead resistance or a realistic
+      ~1-2 week measured move (TARGET_WEEKLY_ATR_MULT x weekly ATR); TP2 the
+      farther of the two. On breakouts (no overhead supply) both are measured
+      moves.
+    - R:R is computed from the real target distance, so it varies per stock.
+    """
     result = {
-        "entry": None,
-        "stop": None,
-        "tp1": None,
-        "tp2": None,
-        "rr_ratio": None,
-        "risk_distance": None,
+        "entry": None, "stop": None, "tp1": None, "tp2": None,
+        "rr_ratio": None, "risk_distance": None, "target_basis": None,
     }
 
     try:
         entry = current_price * 1.001
         result["entry"] = entry
 
-        lowest_10d = df["close"].tail(10).min()
-        atr_stop = entry - (1.5 * atr_14) if atr_14 and atr_14 > 0 else entry * 0.95
-        stop = max(min(lowest_10d, atr_stop), entry * 0.85)
-        result["stop"] = stop
+        valid_atr = bool(atr_14) and atr_14 > 0 and not pd.isna(atr_14)
+        weekly_atr = (atr_14 * np.sqrt(5)) if valid_atr else entry * 0.03
+
+        # --- Stop: structural support or volatility band, then clamp risk ---
+        swing_low = float(df["low"].tail(15).min())
+        atr_stop = entry - SWING_STOP_ATR_MULT * atr_14 if valid_atr else entry * 0.95
+        stop = min(atr_stop, swing_low - (0.1 * atr_14 if valid_atr else 0))
 
         risk_distance = entry - stop
-        if risk_distance > 0 and risk_distance < entry * 0.15:
-            result["tp1"] = entry + (1.5 * risk_distance)
-            result["tp2"] = entry + (2.5 * risk_distance)
-            result["risk_distance"] = risk_distance
-            result["rr_ratio"] = (result["tp1"] - entry) / risk_distance
+        risk_distance = min(risk_distance, entry * MAX_STOP_PCT)          # cap risk
+        risk_distance = max(risk_distance, 0.75 * atr_14 if valid_atr else entry * 0.02)  # floor
+        stop = entry - risk_distance
+        result["stop"] = stop
+        result["risk_distance"] = risk_distance
+
+        # --- Targets: overhead resistance vs realistic measured move ---
+        reach = TARGET_WEEKLY_ATR_MULT * weekly_atr
+        # Resistance must be PRIOR overhead supply, so exclude the most recent
+        # bars - otherwise a stock at new highs treats its own price as the
+        # ceiling and produces a near-zero target.
+        highs = df["high"]
+        window = highs.iloc[max(0, len(highs) - TARGET_LOOKBACK_DAYS):-10]
+        resistance = float(window.max()) if len(window) else entry
+
+        if resistance > entry * 1.005:
+            # Sell just under overhead supply; cap TP1 at a reachable distance.
+            res_target = resistance * 0.997
+            tp1 = min(res_target, entry + reach)
+            tp2 = max(res_target, entry + reach)
+            result["target_basis"] = "resistance"
         else:
-            result["stop"] = entry * 0.95
-            result["risk_distance"] = entry * 0.05
-            result["tp1"] = entry * 1.075
-            result["tp2"] = entry * 1.125
-            result["rr_ratio"] = 1.5
+            # Breakout / new highs: no overhead supply, project a measured move.
+            tp1 = entry + reach
+            tp2 = entry + 1.7 * reach
+            result["target_basis"] = "measured_move"
+
+        result["tp1"] = tp1
+        result["tp2"] = tp2
+        result["rr_ratio"] = (tp1 - entry) / risk_distance if risk_distance > 0 else None
     except Exception as exc:
         logger.debug(f"RTR calc error: {exc}")
 
@@ -1206,7 +1246,7 @@ def screen_stocks(universe: List[Dict], macro: Dict) -> List[Dict]:
 
             atr_14 = calculate_atr(bars).iloc[-1]
             rtr = calculate_rtr(current_price, bars, atr_14)
-            if not rtr["rr_ratio"] or rtr["rr_ratio"] < 1.0:
+            if not rtr["rr_ratio"] or rtr["rr_ratio"] < MIN_RR_RATIO:
                 continue
 
             # --- Earnings check last: only on the few survivors ---
