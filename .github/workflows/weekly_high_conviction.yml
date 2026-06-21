@@ -48,6 +48,7 @@ jobs:
           EMAIL_ADDRESS: ${{ secrets.SENDER_EMAIL }}
           EMAIL_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
 
           TEST_MODE: "false"
         run: |

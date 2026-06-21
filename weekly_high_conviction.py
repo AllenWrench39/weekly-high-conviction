@@ -12,6 +12,7 @@ import logging
 import os
 import smtplib
 import sys
+import time
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -19,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 try:
@@ -47,6 +49,16 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "")
+
+# Finnhub: optional primary source for fundamentals/earnings/quotes/bars.
+# When no key is set, every Finnhub call is skipped and the script falls
+# back to yfinance, so it stays safe to "test it out" without one.
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+USE_FINNHUB = bool(FINNHUB_API_KEY) and os.getenv("USE_FINNHUB", "true").lower() == "true"
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
+FINNHUB_TIMEOUT = int(os.getenv("FINNHUB_TIMEOUT", "10"))
+# Free tier allows 60 calls/min; stay just under to avoid 429s.
+FINNHUB_RATE_LIMIT_PER_MIN = int(os.getenv("FINNHUB_RATE_LIMIT_PER_MIN", "55"))
 
 UNIVERSE_JSON_PATH = os.getenv("UNIVERSE_JSON_PATH", "universe.json")
 DAILY_SCREENER_CSV = os.getenv("DAILY_SCREENER_CSV", "")
@@ -112,6 +124,154 @@ def init_alpaca_backup() -> bool:
     except Exception as exc:
         logger.warning(f"Alpaca backup init failed: {exc}")
         return False
+
+
+# ============================================================================
+# FINNHUB (optional primary source)
+# ============================================================================
+
+_finnhub_last_call = 0.0
+_finnhub_min_interval = 60.0 / max(FINNHUB_RATE_LIMIT_PER_MIN, 1)
+
+
+def _finnhub_get(path: str, params: Dict) -> Optional[dict]:
+    """Rate-limited GET against the Finnhub REST API. Returns parsed JSON,
+    or None on any error (missing key, 403/429, timeout, bad payload) so
+    callers can fall back to yfinance."""
+    global _finnhub_last_call
+
+    if not USE_FINNHUB:
+        return None
+
+    wait = _finnhub_min_interval - (time.monotonic() - _finnhub_last_call)
+    if wait > 0:
+        time.sleep(wait)
+
+    try:
+        query = dict(params)
+        query["token"] = FINNHUB_API_KEY
+        resp = requests.get(
+            f"{FINNHUB_BASE_URL}{path}",
+            params=query,
+            timeout=FINNHUB_TIMEOUT,
+        )
+        _finnhub_last_call = time.monotonic()
+
+        if resp.status_code == 429:
+            logger.warning("Finnhub rate limit hit (429) - backing off")
+            time.sleep(2)
+            return None
+        if resp.status_code == 403:
+            logger.debug(f"Finnhub 403 for {path} (plan does not allow this endpoint)")
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        _finnhub_last_call = time.monotonic()
+        logger.debug(f"Finnhub request failed for {path}: {exc}")
+        return None
+
+
+def finnhub_get_fundamentals(ticker: str) -> Optional[Dict]:
+    data = _finnhub_get("/stock/metric", {"symbol": ticker, "metric": "all"})
+    if not data:
+        return None
+
+    metric = data.get("metric")
+    if not isinstance(metric, dict):
+        return None
+
+    def first(*keys):
+        for key in keys:
+            value = metric.get(key)
+            if value is not None:
+                return value
+        return None
+
+    roe_pct = first("roeTTM", "roeAnnual")
+    eg_pct = first("epsGrowthTTMYoy", "epsGrowthQuarterlyYoy", "revenueGrowthTTMYoy")
+    de = first("totalDebt/totalEquityQuarterly", "totalDebt/totalEquityAnnual",
+               "longTermDebt/equityQuarterly", "longTermDebt/equityAnnual")
+    cap_millions = first("marketCapitalization")
+    vol_millions = first("10DayAverageTradingVolume", "3MonthAverageTradingVolume")
+
+    return {
+        # Finnhub reports ROE / EPS growth as percentages; convert to the
+        # fractions score_fundamental() expects (yfinance convention).
+        "roe": (roe_pct / 100.0) if roe_pct is not None else None,
+        "earnings_growth": (eg_pct / 100.0) if eg_pct is not None else None,
+        "debt_to_equity": de,
+        "market_cap": (cap_millions * 1e6) if cap_millions is not None else None,
+        "avg_volume": (vol_millions * 1e6) if vol_millions is not None else None,
+    }
+
+
+def finnhub_check_earnings_soon(ticker: str) -> Optional[bool]:
+    """Returns True/False if Finnhub answered, or None if unavailable so the
+    caller can fall back to yfinance."""
+    today = datetime.now().date()
+    end = today + timedelta(days=EXCLUDE_EARNINGS_DAYS)
+    data = _finnhub_get(
+        "/calendar/earnings",
+        {"from": today.isoformat(), "to": end.isoformat(), "symbol": ticker},
+    )
+    if data is None:
+        return None
+
+    events = data.get("earningsCalendar")
+    if not isinstance(events, list):
+        return False
+
+    for event in events:
+        date_str = event.get("date")
+        if not date_str:
+            continue
+        try:
+            event_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if 0 <= (event_date - today).days <= EXCLUDE_EARNINGS_DAYS:
+            return True
+    return False
+
+
+def finnhub_get_quote(ticker: str) -> Optional[float]:
+    data = _finnhub_get("/quote", {"symbol": ticker})
+    if not data:
+        return None
+    for key in ("c", "pc"):
+        value = data.get(key)
+        if value and value > 0:
+            return float(value)
+    return None
+
+
+def finnhub_get_bars(ticker: str, num_days: int) -> Optional[pd.DataFrame]:
+    end = int(time.time())
+    start = end - (num_days + 40) * 86400
+    data = _finnhub_get(
+        "/stock/candle",
+        {"symbol": ticker, "resolution": "D", "from": start, "to": end},
+    )
+    if not data or data.get("s") != "ok":
+        return None
+
+    try:
+        df = pd.DataFrame(
+            {
+                "open": data["o"],
+                "high": data["h"],
+                "low": data["l"],
+                "close": data["c"],
+                "volume": data["v"],
+            },
+            index=pd.to_datetime(data["t"], unit="s"),
+        ).dropna().sort_index()
+        if len(df) < 50:
+            return None
+        return df
+    except Exception:
+        return None
 
 
 # ============================================================================
@@ -376,6 +536,23 @@ def get_all_bars(tickers: List[str]) -> Dict[str, pd.DataFrame]:
             batch = missing[i:i + ALPACA_BATCH_SIZE]
             bars.update(get_bars_alpaca_batch(batch, LOOKBACK_TECHNICAL_DAYS))
 
+    still_missing = [ticker for ticker in tickers if ticker not in bars]
+    if still_missing and USE_FINNHUB:
+        logger.info(f"Trying Finnhub bars for {len(still_missing)} symbols...")
+        consecutive_failures = 0
+        for ticker in still_missing:
+            df = finnhub_get_bars(ticker, LOOKBACK_TECHNICAL_DAYS)
+            if df is not None:
+                bars[ticker] = df
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                # Candle history needs a paid plan; bail early instead of
+                # burning the rate limit on an endpoint we can't access.
+                if consecutive_failures >= 5:
+                    logger.info("Finnhub bars unavailable - stopping fallback")
+                    break
+
     logger.info(f"Got bars for {len(bars)} symbols")
     return bars
 
@@ -388,6 +565,10 @@ def get_latest_price(ticker: str, bars: Optional[pd.DataFrame] = None) -> Option
                 return price
         except Exception:
             pass
+
+    fh_price = finnhub_get_quote(ticker)
+    if fh_price:
+        return fh_price
 
     try:
         info = yf.Ticker(ticker).fast_info
@@ -426,20 +607,36 @@ def get_yf_info(ticker: str) -> Dict:
 
 
 def get_fundamentals(ticker: str, universe_meta: Dict) -> Dict:
-    info = get_yf_info(ticker)
+    fh = finnhub_get_fundamentals(ticker) or {}
+    roe = fh.get("roe")
+    de = fh.get("debt_to_equity")
+    eg = fh.get("earnings_growth")
+
+    sector = universe_meta.get("sector") or ""
+    industry = universe_meta.get("industry") or ""
+
+    # Only pay for the slow yfinance.info call when Finnhub gave us nothing
+    # useful, or when we still need sector metadata for the macro score.
+    need_yf = (roe is None and de is None and eg is None) or not sector
+    info = get_yf_info(ticker) if need_yf else {}
 
     return {
-        "roe": info.get("returnOnEquity"),
-        "debt_to_equity": info.get("debtToEquity"),
-        "earnings_growth": info.get("earningsGrowth"),
-        "market_cap": universe_meta.get("market_cap") or info.get("marketCap"),
-        "avg_volume": universe_meta.get("avg_volume") or info.get("averageVolume") or info.get("averageDailyVolume10Day"),
-        "sector": universe_meta.get("sector") or info.get("sector", ""),
-        "industry": universe_meta.get("industry") or info.get("industry", ""),
+        "roe": roe if roe is not None else info.get("returnOnEquity"),
+        "debt_to_equity": de if de is not None else info.get("debtToEquity"),
+        "earnings_growth": eg if eg is not None else info.get("earningsGrowth"),
+        "market_cap": universe_meta.get("market_cap") or fh.get("market_cap") or info.get("marketCap"),
+        "avg_volume": (universe_meta.get("avg_volume") or fh.get("avg_volume")
+                       or info.get("averageVolume") or info.get("averageDailyVolume10Day")),
+        "sector": sector or info.get("sector", ""),
+        "industry": industry or info.get("industry", ""),
     }
 
 
 def check_earnings_soon(ticker: str) -> bool:
+    fh = finnhub_check_earnings_soon(ticker)
+    if fh is not None:
+        return fh
+
     try:
         cal = yf.Ticker(ticker).calendar
         if cal is None or (isinstance(cal, dict) and not cal):
@@ -1147,6 +1344,13 @@ def main() -> None:
     logger.info("=" * 85)
 
     init_alpaca_backup()
+
+    if USE_FINNHUB:
+        logger.info(f"Finnhub enabled (rate limit {FINNHUB_RATE_LIMIT_PER_MIN}/min)")
+    elif FINNHUB_API_KEY:
+        logger.info("Finnhub key present but disabled via USE_FINNHUB")
+    else:
+        logger.info("Finnhub not configured - using yfinance only")
 
     universe = build_universe()
     if not universe:
